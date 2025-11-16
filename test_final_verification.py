@@ -201,10 +201,11 @@ if __name__ == "__main__":
     if "RANK" in os.environ:
         # Multi-GPU test
         result = test_multi_gpu_training()
-        if get_rank() == 0:
-            print(f"\nTest result: {'PASSED' if result else 'FAILED'}")
+        # Only rank 0 prints final result
+        if get_rank() == 0 and result is not None:
+            sys.exit(0 if result else 1)
     else:
         # Single GPU test
         result = test_single_gpu_equivalence()
-        print(f"\nTest result: {'PASSED' if result else 'FAILED'}")
+        sys.exit(0 if result else 1)
 

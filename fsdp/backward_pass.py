@@ -13,11 +13,12 @@ Key concepts:
 - Why reduce-scatter not all-reduce: Saves memory (N/W vs N gradient storage)
 """
 
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, Callable, Tuple, List
 from fsdp.flat_param import FlatParameter
-from fsdp.utils import reduce_scatter_tensor, get_world_size
+from fsdp.utils import reduce_scatter_tensor, get_world_size, get_rank
 
 
 def reduce_scatter_grads(
@@ -50,15 +51,31 @@ def reduce_scatter_grads(
     # Collect gradients from original parameters (views)
     # After backward, gradients are in orig_param.grad, not flat_param.grad
     full_grad_list = []
-    for orig_param in flat_param._orig_params:
+    
+    # DEBUG
+    DEBUG = os.environ.get("DEBUG_GRADS") == "1"
+    
+    if DEBUG:
+        print(f"[DEBUG Rank {get_rank()}] Number of orig_params: {len(flat_param._orig_params)}")
+    
+    for i, orig_param in enumerate(flat_param._orig_params):
         if orig_param.grad is not None:
-            full_grad_list.append(orig_param.grad.flatten())
+            grad_flat = orig_param.grad.flatten()
+            full_grad_list.append(grad_flat)
+            if DEBUG:
+                print(f"[DEBUG Rank {get_rank()}] orig_param {i} grad sum: {grad_flat.sum().item():.10f}, numel: {grad_flat.numel()}")
         else:
             # No gradient for this parameter
-            full_grad_list.append(torch.zeros_like(orig_param.data.flatten()))
+            zeros = torch.zeros_like(orig_param.data.flatten())
+            full_grad_list.append(zeros)
+            if DEBUG:
+                print(f"[DEBUG Rank {get_rank()}] orig_param {i} grad: None, using zeros")
     
     # Concatenate all gradients into a single flat gradient
     full_grad = torch.cat(full_grad_list)
+    
+    if DEBUG:
+        print(f"[DEBUG Rank {get_rank()}] full_grad sum BEFORE padding: {full_grad.sum().item():.10f}, numel: {full_grad.numel()}")
     
     # For single rank, just copy (no padding needed)
     if flat_param.world_size == 1:
@@ -74,16 +91,22 @@ def reduce_scatter_grads(
             torch.zeros(padding_size, dtype=full_grad.dtype, device=full_grad.device)
         ])
     
+    if DEBUG and get_rank() == 0:
+        print(f"[DEBUG] full_grad sum AFTER padding: {full_grad.sum().item():.10f}")
+        print(f"[DEBUG] full_grad numel: {full_grad.numel()}, padded_total: {flat_param._padded_total_numel}")
+    
     # Allocate storage for local gradient shard
     local_grad_shard = torch.empty_like(flat_param.data)
     
     # Reduce-scatter: sum gradients and distribute shards
-    from fsdp.utils import reduce_scatter_tensor
     reduce_scatter_tensor(
         output_tensor=local_grad_shard,
         input_tensor=full_grad,
         async_op=False
     )
+    
+    if DEBUG and get_rank() == 0:
+        print(f"[DEBUG] local_grad_shard sum AFTER reduce-scatter: {local_grad_shard.sum().item():.10f}")
     
     # CRITICAL: Average gradients across world_size (data parallel)
     # reduce-scatter sums gradients from all ranks, but for data parallel
@@ -91,6 +114,9 @@ def reduce_scatter_grads(
     # NOTE: Only divide if world_size > 1, for world_size=1 no reduction happens
     if flat_param.world_size > 1:
         local_grad_shard.div_(flat_param.world_size)
+    
+    if DEBUG and get_rank() == 0:
+        print(f"[DEBUG] local_grad_shard sum AFTER averaging: {local_grad_shard.sum().item():.10f}")
     
     # CRITICAL: Zero out any padding in the gradient shard
     # This ensures padding doesn't affect optimizer updates
