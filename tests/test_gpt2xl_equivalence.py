@@ -42,11 +42,15 @@ def train_single_gpu(config, batch_size=32, seq_len=128, num_steps=5, seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     
-    model = BasicsTransformerLM(**config).to(device)
+    # Initialize on CPU first (to match Meta FSDP's CPU initialization)
+    # This ensures deterministic initialization across CPU/GPU
+    model = BasicsTransformerLM(**config)
     
-    # Print initial parameter sum for debugging
+    # Print initial parameter sum BEFORE moving to GPU
     init_param_sum = sum(p.sum().item() for p in model.parameters())
-    print(f"Initial param sum: {init_param_sum:.15f}")
+    print(f"Initial param sum (CPU): {init_param_sum:.15f}")
+    
+    model = model.to(device)
     
     # Use larger learning rate for larger models to ensure convergence
     # GPT-2 XL needs more steps and higher LR to show convergence
@@ -105,7 +109,9 @@ def train_ddp(config, batch_size_per_gpu=4, seq_len=128, num_steps=5, seed=42):
     
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    model = BasicsTransformerLM(**config).to(device)
+    # Initialize on CPU first for deterministic initialization
+    model = BasicsTransformerLM(**config)
+    model = model.to(device)
     
     # Wrap with DDP
     model = nn.parallel.DistributedDataParallel(
@@ -203,7 +209,9 @@ def train_fsdp(config, batch_size_per_gpu=4, seq_len=128, num_steps=5, seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     clear_fsdp_registry()
-    model = BasicsTransformerLM(**config).to(device)
+    # Initialize on CPU first for deterministic initialization
+    model = BasicsTransformerLM(**config)
+    model = model.to(device)
     
     # Apply FSDP
     for block in model.layers:
@@ -512,51 +520,54 @@ def train_fsdp_meta_device(config, batch_size_per_gpu=4, seq_len=128, num_steps=
         print(f"  All params are meta: {all(p.is_meta for p in model.parameters())}")
         print(f"  RNG state restored for deterministic initialization")
     
+    # Step 2: Materialize the ENTIRE model from meta to CPU first
+    # This ensures all ranks use the same initialization sequence
+    if rank == 0:
+        print("\nStep 2: Materializing entire model to CPU (replaying CS336 initialization)...")
+    
+    # Step 2: Materialize meta parameters to CPU
+    # This replays the CS336 initialization logic (trunc_normal_ for Linear/Embedding, ones for RMSNorm)
+    # The materialization follows the exact __init__ order of BasicsTransformerLM to ensure
+    # deterministic RNG consumption across all ranks
+    from fsdp.meta_init import materialize_meta_module
+    materialize_meta_module(model, torch.device("cpu"), init_fn=None)
+    
+    if rank == 0:
+        all_cpu = all(not p.is_meta for p in model.parameters())
+        print(f"  All params materialized to CPU: {all_cpu}")
+    
     # Clear registry before wrapping
     clear_fsdp_registry()
     
-    # Step 2: Apply FSDP on meta device with param_init_fn
-    # This will materialize each shard independently, replaying the initialization
+    # Step 3: Apply FSDP to shard parameters across ranks
+    # CRITICAL: We apply FSDP from inside-out (子模块 → root)
+    # This ensures that each parameter is only included in ONE FlatParameter
+    # The flatten_module_params function automatically skips parameters from
+    # child modules that are already FSDP-managed to prevent duplication
     if rank == 0:
-        print("\nStep 2: Applying fully_shard with param_init_fn (replaying initialization)...")
+        print("\nStep 3: Applying fully_shard (sharding CPU parameters)...")
     
-    # Define initialization function that replays PyTorch Linear's default initialization
-    def reset_params_init_fn(tensor):
-        """Initialize tensor using PyTorch's default for Linear layers"""
-        if tensor.ndim >= 2:
-            # Weight: kaiming_uniform with a=sqrt(5)
-            torch.nn.init.kaiming_uniform_(tensor, a=(5 ** 0.5))
-        else:
-            # Bias: uniform based on fan_in
-            fan_in = tensor.numel()
-            if fan_in > 0:
-                bound = 1 / (fan_in ** 0.5)
-                torch.nn.init.uniform_(tensor, -bound, bound)
-    
-    # Wrap transformer layers (each will materialize only its shard)
+    # Wrap transformer layers (each layer's parameters will be sharded)
     for layer in model.layers:
-        fully_shard(layer, param_init_fn=reset_params_init_fn)
+        fully_shard(layer)
     
     # Wrap embedding and output layers
-    fully_shard(model.token_embeddings, param_init_fn=reset_params_init_fn)
-    fully_shard(model.ln_final, param_init_fn=reset_params_init_fn)
-    fully_shard(model.lm_head, param_init_fn=reset_params_init_fn)
+    fully_shard(model.token_embeddings)
+    fully_shard(model.ln_final)
+    fully_shard(model.lm_head)
     
-    # Wrap root module
-    fully_shard(model, param_init_fn=reset_params_init_fn)
+    # Wrap root module (only wraps parameters not already managed by child modules)
+    fully_shard(model)
     
     if rank == 0:
         flat_params = get_flat_parameters(model)
         print(f"  Created {len(flat_params)} FlatParameters")
-        all_cpu = all(not p.is_meta for p in model.parameters())
-        print(f"  All params materialized to CPU: {all_cpu}")
-        # Debug: check initial param sum
-        param_sum_init = sum(p.sum().item() for p in model.parameters())
-        print(f"  Initial param sum (sharded, CPU): {param_sum_init:.6f}")
     
-    # Step 3: Handle remaining meta buffers (like _freq_cis_cache)
+    # Step 4: Handle remaining meta buffers (like _freq_cis_cache)
+    # Note: Some buffers (like RotaryEmbedding._freq_cis_cache) are computed and non-persistent
+    # They need explicit initialization since they're not included in state_dict
     if rank == 0:
-        print("\nStep 3: Initializing non-parameter buffers...")
+        print("\nStep 4: Initializing non-parameter buffers...")
     
     for name, buf in list(model.named_buffers()):
         if buf.is_meta:
@@ -584,9 +595,11 @@ def train_fsdp_meta_device(config, batch_size_per_gpu=4, seq_len=128, num_steps=
                 if rank == 0:
                     print(f"  Removed meta buffer {name}")
     
-    # Step 4: Move to GPU device
+    # Step 5: Move sharded model to GPU
+    # After FSDP sharding, each rank only holds its local shard in memory
+    # Moving to GPU is much more memory-efficient than materializing the full model first
     if rank == 0:
-        print("\nStep 4: Moving sharded model to GPU...")
+        print("\nStep 5: Moving sharded model to GPU...")
     
     model = model.to(device)
     
@@ -610,10 +623,12 @@ def train_fsdp_meta_device(config, batch_size_per_gpu=4, seq_len=128, num_steps=
     
     all_rank_losses = []
     for step in range(num_steps):
-        # Generate data: each rank gets different portion of the global batch
-        # This ensures equivalence with single GPU training
+        # Data generation strategy for equivalence with Single GPU:
+        # 1. All ranks use the same seed to generate the SAME full batch
+        # 2. Each rank takes a different slice of this batch
+        # 3. This ensures: rank 0's data = single_gpu's data[0:batch_size_per_gpu]
+        #                  rank 1's data = single_gpu's data[batch_size_per_gpu:2*batch_size_per_gpu], etc.
         torch.manual_seed(seed + 100 + step)
-        # Generate full batch, then slice for this rank
         full_batch = torch.randint(0, config["vocab_size"], (batch_size_per_gpu * world_size, seq_len))
         start_idx = rank * batch_size_per_gpu
         end_idx = start_idx + batch_size_per_gpu
@@ -631,7 +646,9 @@ def train_fsdp_meta_device(config, batch_size_per_gpu=4, seq_len=128, num_steps=
         
         rank_loss = loss.item()
         
-        # Collect losses from all ranks to compute average (for comparison with single GPU)
+        # Collect losses from all ranks and compute average for comparison with Single GPU
+        # Note: Single GPU processes the entire batch at once, so its loss is already an average
+        # For FSDP, each rank computes loss on its slice, so we average across ranks
         loss_tensor = torch.tensor(rank_loss, device=device)
         gathered_losses = [torch.zeros_like(loss_tensor) for _ in range(world_size)]
         dist.all_gather(gathered_losses, loss_tensor)

@@ -288,29 +288,98 @@ class FlatParameter(nn.Parameter):
         )
 
 
+def _is_fsdp_managed_recursively(module: nn.Module) -> bool:
+    """Recursively check if a module or any of its descendants is FSDP-managed.
+    
+    This is CRITICAL for preventing parameter duplication in nested FSDP.
+    
+    Why we need this:
+    When we apply FSDP to nested modules like:
+        for layer in model.layers:
+            fully_shard(layer)  # layer is now FSDP-managed
+        fully_shard(model)      # root model wrapping
+    
+    The root's `model.parameters(recurse=True)` would include layer's parameters.
+    But layer's parameters are already in layer's FlatParameter!
+    We must skip them to avoid including the same parameter in multiple FlatParameters.
+    
+    Args:
+        module: Module to check
+        
+    Returns:
+        True if module or any descendant has been wrapped with FSDP
+        
+    Example:
+        >>> fully_shard(model.layers[0])
+        >>> _is_fsdp_managed_recursively(model.layers)  # True (child is managed)
+        >>> _is_fsdp_managed_recursively(model.embedding)  # False (not managed yet)
+    """
+    if hasattr(module, '_is_fsdp_managed') and module._is_fsdp_managed:
+        return True
+    # Recursively check all children
+    for child in module.children():
+        if _is_fsdp_managed_recursively(child):
+            return True
+    return False
+
+
 def flatten_module_params(
     module: nn.Module,
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
 ) -> FlatParameter:
-    """Flatten all parameters in a module into a FlatParameter.
+    """Flatten parameters in a module into a FlatParameter, avoiding duplication.
+    
+    This function intelligently collects parameters to avoid including the same parameter
+    in multiple FlatParameters when using nested FSDP.
+    
+    Parameter Collection Strategy:
+    1. Include all parameters directly owned by this module (recurse=False)
+    2. For each child module:
+       - If child is NOT FSDP-managed: include all its parameters (recurse=True)
+       - If child IS FSDP-managed: skip it (its parameters are already in another FlatParameter)
+    
+    Why this matters:
+    Without this logic, nested FSDP would cause parameter duplication:
+        for layer in model.layers:
+            fully_shard(layer)    # Creates FlatParameter for layer's params
+        fully_shard(model)         # Would include layer's params AGAIN without filtering
     
     Args:
         module: Module whose parameters to flatten
-        rank: Current rank
-        world_size: World size
+        rank: Current rank (default: get_rank())
+        world_size: World size (default: get_world_size())
     
     Returns:
-        FlatParameter containing all module parameters
+        FlatParameter containing this module's parameters (excluding FSDP-managed children)
+        
+    Raises:
+        ValueError: If module has no parameters to flatten (all children already managed)
     
     Example:
-        >>> module = nn.Sequential(nn.Linear(10, 10), nn.Linear(10, 5))
-        >>> flat_param = flatten_module_params(module, rank=0, world_size=2)
-        >>> # Rank 0 now has ~half of the parameters
+        >>> # Nested FSDP usage
+        >>> for layer in model.layers:
+        ...     fully_shard(layer)  # Each layer's params go into its own FlatParameter
+        >>> fully_shard(model.token_embeddings)  # Embedding params in separate FlatParameter
+        >>> fully_shard(model)  # Only includes params not in child modules
     """
-    params = list(module.parameters(recurse=True))  # Recurse to get all nested parameters
+    # Collect parameters intelligently to avoid duplication
+    params = []
+    
+    # 1. Get direct parameters (those defined on this module itself)
+    params.extend(module.parameters(recurse=False))
+    
+    # 2. Recursively collect parameters from non-FSDP children
+    for name, child in module.named_children():
+        if not _is_fsdp_managed_recursively(child):
+            # Child (and all its descendants) are not FSDP-wrapped
+            # Safe to include all their parameters
+            params.extend(child.parameters(recurse=True))
+        # Else: child is FSDP-managed, its parameters are already in another FlatParameter
+        # We skip it to avoid duplication
+    
     if not params:
-        raise ValueError("Module has no parameters to flatten")
+        raise ValueError("Module has no parameters to flatten (all children already FSDP-managed)")
     
     return FlatParameter(params, rank=rank, world_size=world_size)
 

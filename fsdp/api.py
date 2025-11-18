@@ -106,6 +106,24 @@ def fully_shard(
         _FSDP_MODULE_REGISTRY[id(module)] = None
         return module
     
+    # Edge case: Check if all parameters are already managed by FSDP child modules
+    # This happens when we call fully_shard on a container module after wrapping all its children
+    # Example: fully_shard(model) after fully_shard(layer) for all layers
+    from fsdp.flat_param import _is_fsdp_managed_recursively
+    all_children_managed = all(
+        _is_fsdp_managed_recursively(child) or len(list(child.parameters(recurse=True))) == 0
+        for child in module.children()
+    )
+    has_direct_params = len(list(module.parameters(recurse=False))) > 0
+    
+    if all_children_managed and not has_direct_params:
+        # All parameters are already sharded in child modules
+        # No need to create another FlatParameter for this module
+        # Just mark it as FSDP-managed for consistency
+        _FSDP_MODULE_REGISTRY[id(module)] = None
+        module._is_fsdp_managed = True
+        return module
+    
     # Check if module is on meta device
     has_meta = any(p.is_meta for p in params)
     

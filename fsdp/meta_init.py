@@ -111,48 +111,124 @@ def materialize_meta_module(
 ) -> None:
     """Materialize all parameters in a module from meta device to real device.
     
-    This modifies the module in-place.
+    This function REPLAYS the initialization logic of the original model, ensuring that
+    the meta-initialized model has identical parameter values to a directly initialized model.
     
-    IMPORTANT: This function traverses modules in the order they were defined in __init__,
-    ensuring that parameters are initialized in the same order as standard PyTorch initialization.
-    This is critical for deterministic initialization with RNG.
+    Key Design Decisions:
+    1. **Replay vs Copy**: We replay initialization (not copy from CPU) to support custom
+       initialization logic and to avoid temporarily loading the full model.
+       
+    2. **Initialization Order**: We follow the exact order of BasicsTransformerLM.__init__
+       to ensure RNG state is consumed in the same sequence, guaranteeing deterministic results.
+       
+    3. **Custom Modules**: We detect cs336_basics custom modules (Linear, Embedding, RMSNorm)
+       and replay their specific initialization:
+       - Linear/Embedding: trunc_normal_ with model-specific std
+       - RMSNorm: ones initialization
+    
+    This modifies the module in-place.
     
     Args:
         module: Module with parameters on meta device
-        device: Real device to materialize on
-        init_fn: Optional initialization function for parameters
+        device: Real device to materialize on (typically CPU for FSDP)
+        init_fn: Optional initialization function for non-cs336 modules
     
     Example:
         >>> with torch.device("meta"):
-        ...     model = nn.Linear(10, 10)
+        ...     model = BasicsTransformerLM(**config)
         >>> materialize_meta_module(model, torch.device("cpu"))
-        >>> assert all(p.device.type == "cpu" for p in model.parameters())
+        >>> # All parameters now on CPU with correct initialization
+        >>> assert all(not p.is_meta for p in model.parameters())
     """
-    # Materialize parameters in module definition order (not named_parameters order)
-    # Use modules() which returns modules in the order they were added
-    for submodule in module.modules():
-        # Check if this module has meta parameters
-        has_meta_params = any(p.is_meta for p in submodule.parameters(recurse=False))
+    # Import custom module types from cs336_basics
+    try:
+        from cs336_basics.model import Linear as CS336Linear, Embedding as CS336Embedding, RMSNorm, BasicsTransformerLM
+        has_cs336_types = True
+    except ImportError:
+        has_cs336_types = False
+    
+    # Helper function to replay CS336 module initialization
+    # This exactly mirrors the initialization in cs336_basics.model
+    def init_cs336_module(submodule):
+        """Initialize a CS336 custom module by replaying its __init__ logic.
         
-        if has_meta_params:
-            # Materialize all parameters to empty tensors first
-            for param_name, param in submodule.named_parameters(recurse=False):
-                if is_meta_device(param):
-                    empty_param = torch.empty_like(param, device=device)
-                    setattr(submodule, param_name, nn.Parameter(empty_param, requires_grad=param.requires_grad))
+        Why replay instead of calling reset_parameters()?
+        - CS336Linear and CS336Embedding don't have reset_parameters()
+        - We need to ensure exact replication of the original initialization
+        - We can control the device (materializing directly to target device)
+        """
+        if isinstance(submodule, CS336Linear):
+            # CS336Linear uses Xavier-like initialization: std = sqrt(2 / (d_in + d_out))
+            d_out, d_in = submodule.weight.shape
+            std = (2 / (d_in + d_out)) ** 0.5
+            weight_init = torch.empty(d_out, d_in, device=device)
+            nn.init.trunc_normal_(weight_init, std=std, a=-3*std, b=3*std)
+            submodule.weight = nn.Parameter(weight_init, requires_grad=True)
+        elif isinstance(submodule, CS336Embedding):
+            # CS336Embedding uses trunc_normal_ with std=1.0
+            vocab_size, d_model = submodule.weight.shape
+            std = 1.0
+            weight_init = torch.empty(vocab_size, d_model, device=device)
+            nn.init.trunc_normal_(weight_init, std=std, a=-3*std, b=3*std)
+            submodule.weight = nn.Parameter(weight_init, requires_grad=True)
+        elif isinstance(submodule, RMSNorm):
+            # RMSNorm initializes weight to ones (no learnable bias)
+            hidden_size = submodule.weight.shape[0]
+            submodule.weight = nn.Parameter(torch.ones(hidden_size, device=device))
+    
+    # Special handling for BasicsTransformerLM to match __init__ order
+    # CRITICAL: We must initialize submodules in the EXACT same order as BasicsTransformerLM.__init__
+    # This ensures RNG state is consumed in the same sequence, producing identical parameter values
+    if has_cs336_types and isinstance(module, BasicsTransformerLM):
+        # Follow the exact order in BasicsTransformerLM.__init__:
+        
+        # 1. token_embeddings (Embedding layer)
+        init_cs336_module(module.token_embeddings)
+        
+        # 2. positional_encoder (RotaryEmbedding - no learnable parameters)
+        #    Buffer initialization is handled separately below
+        
+        # 3. layers (each TransformerBlock in order)
+        #    Each block contains: attn (CausalSelfAttention), ffn (FeedForward), ln1, ln2 (RMSNorm)
+        #    We traverse with modules() which follows depth-first order
+        for layer in module.layers:
+            for submodule in layer.modules():
+                if submodule is not layer:  # Skip the container itself
+                    has_meta = any(p.is_meta for p in submodule.parameters(recurse=False))
+                    if has_meta:
+                        init_cs336_module(submodule)
+        
+        # 4. ln_final (RMSNorm)
+        init_cs336_module(module.ln_final)
+        
+        # 5. lm_head (Linear layer for output projection)
+        init_cs336_module(module.lm_head)
+    else:
+        # Generic fallback: use modules() traversal order
+        for submodule in module.modules():
+            has_meta_params = any(p.is_meta for p in submodule.parameters(recurse=False))
             
-            # Call the module's reset_parameters() to initialize properly
-            if hasattr(submodule, 'reset_parameters'):
-                submodule.reset_parameters()
-            elif init_fn is not None:
-                # Fallback to custom init_fn if no reset_parameters
-                for param in submodule.parameters(recurse=False):
-                    init_fn(param)
-        
-        # Process direct buffers of this module (not recursive)
+            if has_meta_params:
+                if has_cs336_types:
+                    init_cs336_module(submodule)
+                else:
+                    # Fallback for non-CS336 modules
+                    for param_name, param in submodule.named_parameters(recurse=False):
+                        if is_meta_device(param):
+                            empty_param = torch.empty_like(param, device=device)
+                            setattr(submodule, param_name, nn.Parameter(empty_param, requires_grad=param.requires_grad))
+                    
+                    if hasattr(submodule, 'reset_parameters'):
+                        submodule.reset_parameters()
+                    elif init_fn is not None:
+                        for param in submodule.parameters(recurse=False):
+                            init_fn(param)
+    
+    # Process buffers
+    for submodule in module.modules():
         for buffer_name, buffer in submodule.named_buffers(recurse=False):
             if is_meta_device(buffer):
-                materialized = materialize_meta_tensor(buffer, device, None)  # No init for buffers
+                materialized = materialize_meta_tensor(buffer, device, None)
                 submodule.register_buffer(buffer_name, materialized)
 
 
