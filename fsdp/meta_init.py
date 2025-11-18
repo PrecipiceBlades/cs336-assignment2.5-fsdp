@@ -231,53 +231,6 @@ def materialize_meta_module(
                 materialized = materialize_meta_tensor(buffer, device, None)
                 submodule.register_buffer(buffer_name, materialized)
 
-
-def materialize_shard_only(
-    module: nn.Module,
-    device: torch.device,
-    rank: Optional[int] = None,
-    world_size: Optional[int] = None,
-    init_fn: Optional[Callable[[torch.Tensor], None]] = None
-) -> None:
-    """Materialize only the local shard of parameters for this rank.
-    
-    This is a key optimization: instead of materializing full parameters then sharding,
-    we directly materialize only the shard we need.
-    
-    Args:
-        module: Module with parameters on meta device
-        device: Device to materialize shard on
-        rank: Current rank (if None, uses get_rank())
-        world_size: World size (if None, uses get_world_size())
-        init_fn: Optional initialization function
-    
-    Note:
-        This is a simplified version. Full FSDP would need to coordinate
-        initialization across ranks to ensure all shards come from the same
-        random initialization.
-    
-    Example:
-        >>> with torch.device("meta"):
-        ...     model = nn.Linear(100, 100)  # 10,000 parameters
-        >>> materialize_shard_only(model, torch.device("cpu"), rank=0, world_size=4)
-        >>> # Rank 0 only has ~2,500 parameters materialized
-    """
-    # Simplified implementation: For now, materialize full parameters
-    # In practice, this would be integrated with FlatParameter (Task 2)
-    # which handles the actual sharding
-    rank = rank if rank is not None else get_rank()
-    world_size = world_size if world_size is not None else get_world_size()
-    
-    # For single rank, just materialize everything
-    if world_size == 1:
-        materialize_meta_module(module, device, init_fn)
-        return
-    
-    # For multi-rank, we still materialize full params here
-    # The actual sharding will happen in FlatParameter (Task 2)
-    materialize_meta_module(module, device, init_fn)
-
-
 # Example usage (for testing):
 if __name__ == "__main__":
     # Test 1: Create model on meta device
